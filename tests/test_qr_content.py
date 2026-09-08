@@ -4,7 +4,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from qr_content import build_qr_content
+from qr_content import build_qr_content, build_qr_content_from_history_row
 
 
 BASE_LABELS = {"cabinet": "Блок 1", "season": "Блок 2", "item": "Блок 3"}
@@ -68,3 +68,36 @@ def test_order_reflected_in_output():
     # первая содержательная строка — Фрукт (item), затем Корабль (cabinet)
     assert body[0].startswith("Фрукт")
     assert body[1].startswith("Корабль")
+
+
+HISTORY_ROW = {
+    "code": "KUN_11_08_2026_LE_SH_X001",
+    "cabinet_name": "Кунц",
+    "season_name": "лето",
+    "item_name": "шмот",
+    "seq": 1,
+    "created_at": "2026-08-11 14:30:05",
+}
+
+
+def test_history_row_first_line_is_code():
+    out = build_qr_content_from_history_row(HISTORY_ROW, BASE_LABELS)
+    assert out.splitlines()[0] == "KUN_11_08_2026_LE_SH_X001"
+
+
+def test_history_row_uses_names_and_date_only_part():
+    out = build_qr_content_from_history_row(HISTORY_ROW, BASE_LABELS)
+    assert "Блок 1: Кунц" in out
+    assert "Блок 2: лето" in out
+    assert "Блок 3: шмот" in out
+    assert "Дата: 2026-08-11" in out
+
+
+def test_history_row_seq_padded_and_last():
+    out = build_qr_content_from_history_row(HISTORY_ROW, BASE_LABELS)
+    assert out.splitlines()[-1] == "Номер: 001"
+
+
+def test_history_row_uses_current_custom_labels():
+    out = build_qr_content_from_history_row(HISTORY_ROW, CUSTOM_LABELS)
+    assert "Корабль: Кунц" in out

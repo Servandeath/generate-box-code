@@ -5,8 +5,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from generate_box_code import (
-    generate_box_code, MIN_RANDOM_CHARS, MAX_RANDOM_CHARS, DATE_FORMATS,
-    DEFAULT_BLOCK_ORDER,
+    generate_box_code, format_seq, MIN_RANDOM_CHARS, MAX_RANDOM_CHARS,
+    DATE_FORMATS, DEFAULT_BLOCK_ORDER,
 )
 
 FIXED_DATE = date(2026, 7, 16)
@@ -186,3 +186,17 @@ def test_invalid_block_order_unknown_key_raises():
             "ALF", "DE", "BT", 1, gen_date=FIXED_DATE,
             block_order=("cabinet", "date", "season", "unknown_key"),
         )
+
+
+def test_format_seq_pads_to_min_digits():
+    assert format_seq(1) == "001"
+    assert format_seq(42) == "042"
+
+
+def test_format_seq_grows_with_value():
+    assert format_seq(1234) == "1234"
+
+
+def test_format_seq_matches_code_suffix():
+    code = generate_box_code("ALF", "DE", "BT", 7, gen_date=FIXED_DATE)
+    assert code.endswith(format_seq(7))

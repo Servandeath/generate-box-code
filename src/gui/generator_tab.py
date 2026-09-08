@@ -19,9 +19,10 @@ from datetime import date as date_cls
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from db import list_active, get_next_seq, code_exists, add_box_code
-from generate_box_code import generate_box_code, DATE_FORMATS, DEFAULT_DATE_FORMAT, DEFAULT_BLOCK_ORDER
+from generate_box_code import generate_box_code, format_seq, DATE_FORMATS, DEFAULT_DATE_FORMAT, DEFAULT_BLOCK_ORDER
 from label_render import make_pdf_one_per_page, load_label_settings, register_pdf_font
 from dimension_labels import load_dimension_labels
+from qr_content import build_qr_content
 from gui.label_settings_widget import LabelSettingsWidget
 
 from openpyxl import Workbook
@@ -61,6 +62,7 @@ class GeneratorTab(QWidget):
         super().__init__(parent)
         self.conn = conn
         self._last_batch = []
+        self._code_meta = {}
         self._pdf_font_name = register_pdf_font()
 
         labels = load_dimension_labels()
@@ -245,6 +247,7 @@ class GeneratorTab(QWidget):
 
         # ---- правая колонка ----
         self.label_settings = LabelSettingsWidget()
+        self.label_settings.qr_content_provider = self._preview_qr_content
 
         right_scroll = QScrollArea()
         right_scroll.setWidgetResizable(True)
@@ -357,25 +360,58 @@ class GeneratorTab(QWidget):
         preview = "_".join(parts) + "_"
         self.full_example_label.setText(f"Пример кода: {preview}")
 
+        # состав/порядок блоков и выбранные разделы влияют на содержимое QR,
+        # а объём содержимого - на плотность QR, поэтому превью пересобираем
+        label_settings = getattr(self, "label_settings", None)
+        if label_settings is not None:
+            label_settings.refresh_preview()
+
+    def _preview_qr_content(self, code: str) -> str:
+        """Содержимое QR для превью и тестовой печати - из текущего состояния
+        вкладки (выбранные разделы, дата, порядок и состав блоков). Номер
+        показывается условный: реальный присвоится только при генерации."""
+        order, include = self._get_block_order_and_flags()
+
+        cab = self.cabinet_combo.currentData()
+        sea = self.season_combo.currentData()
+        itm = self.item_combo.currentData()
+        values_ru = {
+            "cabinet": cab[2] if cab else "-",
+            "season": sea[2] if sea else "-",
+            "item": itm[2] if itm else "-",
+        }
+
+        date_key = self.date_format_combo.currentData()
+        qd = self.date_edit.date()
+        try:
+            date_str = DATE_FORMATS[date_key](date_cls(qd.year(), qd.month(), qd.day()))
+        except Exception:
+            date_str = ""
+
+        return build_qr_content(
+            code, order, include, load_dimension_labels(), values_ru,
+            date_str, format_seq(1),
+        )
+
     def refresh_lists(self):
         self.cabinet_combo.clear()
         self.season_combo.clear()
         self.item_combo.clear()
         for row in list_active(self.conn, "cabinets"):
-            self.cabinet_combo.addItem(f"{row['name_ru']} ({row['code_latin']})", (row["id"], row["code_latin"]))
+            self.cabinet_combo.addItem(f"{row['name_ru']} ({row['code_latin']})", (row["id"], row["code_latin"], row["name_ru"]))
         for row in list_active(self.conn, "seasons"):
-            self.season_combo.addItem(f"{row['name_ru']} ({row['code_latin']})", (row["id"], row["code_latin"]))
+            self.season_combo.addItem(f"{row['name_ru']} ({row['code_latin']})", (row["id"], row["code_latin"], row["name_ru"]))
         for row in list_active(self.conn, "item_types"):
-            self.item_combo.addItem(f"{row['name_ru']} ({row['code_latin']})", (row["id"], row["code_latin"]))
+            self.item_combo.addItem(f"{row['name_ru']} ({row['code_latin']})", (row["id"], row["code_latin"], row["name_ru"]))
 
     def _generate_and_write(self):
         if self.cabinet_combo.count() == 0 or self.season_combo.count() == 0 or self.item_combo.count() == 0:
             QMessageBox.warning(self, "Ошибка", "Сначала добавьте записи во все справочники (вкладка Справочники)")
             return
 
-        cabinet_id, cabinet_code = self.cabinet_combo.currentData()
-        season_id, season_code = self.season_combo.currentData()
-        item_id, item_code = self.item_combo.currentData()
+        cabinet_id, cabinet_code, cabinet_name_ru = self.cabinet_combo.currentData()
+        season_id, season_code, season_name_ru = self.season_combo.currentData()
+        item_id, item_code, item_name_ru = self.item_combo.currentData()
         qty = self.qty_spin.value()
 
         block_order, include = self._get_block_order_and_flags()
@@ -386,6 +422,10 @@ class GeneratorTab(QWidget):
         date_format = self.date_format_combo.currentData()
         qd = self.date_edit.date()
         gen_date = date_cls(qd.year(), qd.month(), qd.day())
+        date_str = DATE_FORMATS[date_format](gen_date) if include_date else ""
+
+        dimension_labels = load_dimension_labels()
+        values_ru = {"cabinet": cabinet_name_ru, "season": season_name_ru, "item": item_name_ru}
 
         start_seq = get_next_seq(self.conn, cabinet_id)
 
@@ -423,6 +463,17 @@ class GeneratorTab(QWidget):
                 continue
 
             written_codes.append(code)
+            # метаданные для расшифровки QR (см. _qr_content_for_code) -
+            # сохраняются на момент генерации, т.к. история (list_history)
+            # не хранит порядок/состав блоков и формат даты
+            self._code_meta[code] = {
+                "order": block_order,
+                "include": include,
+                "labels": dimension_labels,
+                "values_ru": values_ru,
+                "date_str": date_str,
+                "seq": seq,
+            }
 
         self._finish_batch(written_codes)
 
@@ -449,6 +500,15 @@ class GeneratorTab(QWidget):
             return [self.table.item(r, 0).text() for r in selected_rows]
         return self._last_batch
 
+    def _qr_content_for_code(self, code: str) -> str | None:
+        meta = self._code_meta.get(code)
+        if meta is None:
+            return None
+        return build_qr_content(
+            code, meta["order"], meta["include"], meta["labels"],
+            meta["values_ru"], meta["date_str"], format_seq(meta["seq"]),
+        )
+
     def _save_pdf(self):
         codes = self._get_export_codes()
         if not codes:
@@ -458,7 +518,10 @@ class GeneratorTab(QWidget):
             return
         try:
             settings = load_label_settings()
-            make_pdf_one_per_page(codes, path, settings, self._pdf_font_name)
+            qr_contents = None
+            if settings.get("label_type") == "qr":
+                qr_contents = [self._qr_content_for_code(code) for code in codes]
+            make_pdf_one_per_page(codes, path, settings, self._pdf_font_name, qr_contents=qr_contents)
             QMessageBox.information(self, "Готово", f"Этикетки сохранены ({len(codes)} шт.): {path}")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", str(e))

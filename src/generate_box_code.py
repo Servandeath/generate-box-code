@@ -67,6 +67,16 @@ def _random_chars(n: int) -> str:
     return "".join(random.choices(RANDOM_ALPHABET, k=n))
 
 
+def format_seq(seq: int) -> str:
+    """Форматирует порядковый номер так же, как в самом коде короба:
+    минимум MIN_SEQ_DIGITS цифр, ширина растёт вместе со значением
+    (001..999, затем 1000, 1001...). Вынесено отдельно, чтобы то же
+    форматирование можно было использовать вне генерации кода
+    (например, в расшифровке QR)."""
+    seq_digits = max(MIN_SEQ_DIGITS, len(str(seq)))
+    return str(seq).zfill(seq_digits)
+
+
 def _validate_block_order(block_order):
     order = tuple(block_order)
     if set(order) != set(BLOCK_KEYS) or len(order) != len(BLOCK_KEYS):
@@ -118,8 +128,8 @@ def generate_box_code(
     else:
         date_part = None
 
-    seq_digits = max(MIN_SEQ_DIGITS, len(str(seq)))
-    seq_part = str(seq).zfill(seq_digits)
+    seq_part = format_seq(seq)
+    seq_digits = len(seq_part)
 
     segment_values = {
         "cabinet": cabinet,

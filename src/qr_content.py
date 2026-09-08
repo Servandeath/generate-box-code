@@ -69,3 +69,35 @@ def build_qr_content(
     lines.append(f"{SEQ_LABEL}: {seq_str}")
 
     return "\n".join(lines)
+
+
+def build_qr_content_from_history_row(row, labels: dict) -> str:
+    """Собирает содержимое QR для перепечатки кода из истории.
+
+    История (db.list_history) не хранит порядок/состав блоков и формат
+    даты, использованные при генерации - только сам код, имена
+    разделов, seq и created_at. Поэтому для перепечатки берётся
+    порядок по умолчанию и все блоки считаются включёнными (что
+    показать в расшифровке важнее, чем точно повторить исходные
+    настройки формата, которые к моменту перепечатки могли уже
+    измениться).
+
+    row   — объект с полями code/cabinet_name/season_name/item_name/
+            seq/created_at (например sqlite3.Row из list_history).
+    labels — текущие подписи разделов (dimension_labels), например
+            {'cabinet': 'Блок 1', 'season': 'Блок 2', 'item': 'Блок 3'}.
+    """
+    from generate_box_code import DEFAULT_BLOCK_ORDER, format_seq
+
+    date_str = str(row["created_at"]).split(" ")[0]
+    values_ru = {
+        "cabinet": row["cabinet_name"],
+        "season": row["season_name"],
+        "item": row["item_name"],
+    }
+    include = {"date": True, "season": True, "item": True}
+
+    return build_qr_content(
+        row["code"], DEFAULT_BLOCK_ORDER, include, labels, values_ru,
+        date_str, format_seq(row["seq"]),
+    )

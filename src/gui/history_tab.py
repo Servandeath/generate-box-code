@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from db import list_history
 from label_render import make_pdf_one_per_page, load_label_settings, register_pdf_font
 from dimension_labels import load_dimension_labels
+from qr_content import build_qr_content_from_history_row
 
 from openpyxl import Workbook
 
@@ -57,6 +58,11 @@ class HistoryTableModel(QAbstractTableModel):
     def code_at(self, row_index: int) -> str | None:
         if 0 <= row_index < len(self._rows):
             return self._rows[row_index]["code"]
+        return None
+
+    def row_at(self, row_index: int):
+        if 0 <= row_index < len(self._rows):
+            return self._rows[row_index]
         return None
 
     def rowCount(self, parent=QModelIndex()):
@@ -178,9 +184,10 @@ class HistoryTab(QWidget):
             QMessageBox.information(self, "Внимание", "Выберите строку с кодом в таблице слева")
             return
 
-        code = self.model.code_at(row_index)
-        if not code:
+        row = self.model.row_at(row_index)
+        if not row:
             return
+        code = row["code"]
 
         path, _ = QFileDialog.getSaveFileName(self, "Перепечатать этикетку", f"{code}_reprint.pdf", "PDF files (*.pdf)")
         if not path:
@@ -188,7 +195,11 @@ class HistoryTab(QWidget):
 
         try:
             settings = load_label_settings()
-            make_pdf_one_per_page([code], path, settings, self._pdf_font_name)
+            qr_contents = None
+            if settings.get("label_type") == "qr":
+                labels = load_dimension_labels()
+                qr_contents = [build_qr_content_from_history_row(row, labels)]
+            make_pdf_one_per_page([code], path, settings, self._pdf_font_name, qr_contents=qr_contents)
             QMessageBox.information(self, "Готово", f"Этикетка перепечатана: {path}")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", str(e))
