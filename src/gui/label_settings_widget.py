@@ -21,11 +21,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from label_render import (
     DEFAULT_LABEL_SETTINGS,
+    MIN_DOTS_PER_MODULE,
+    MIN_MODULE_MM,
     load_label_settings,
     save_label_settings,
     render_preview_image,
     register_pdf_font,
     make_pdf_one_per_page,
+    qr_density,
     load_presets,
     save_preset,
     delete_preset,
@@ -68,6 +71,10 @@ class LabelSettingsWidget(QWidget):
         self.font_name = register_pdf_font()
         self._undo_stack: list[dict] = []
         self._suppress_undo_snapshot = False
+        # функция code -> содержимое QR; ставится снаружи (GeneratorTab),
+        # чтобы превью и тестовая печать показывали ту же расшифровку,
+        # что уйдёт в реальную этикетку
+        self.qr_content_provider = None
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("<b>Превью и настройки этикетки</b>"))
@@ -116,6 +123,15 @@ class LabelSettingsWidget(QWidget):
         self.preview_label.setStyleSheet("background-color: #eeeeee; border: 1px solid #999;")
         layout.addWidget(self.preview_label)
 
+        # плотность QR: сколько миллиметров/точек принтера приходится на
+        # модуль. Объём расшифровки зависит от того, как клиент назвал
+        # разделы, поэтому цифра нужна прямо при настройке, а не после
+        # первой нечитаемой пачки этикеток
+        self.qr_density_label = QLabel()
+        self.qr_density_label.setWordWrap(True)
+        self.qr_density_label.setVisible(False)
+        layout.addWidget(self.qr_density_label)
+
         toggle_row = QHBoxLayout()
         self.toggle_settings_btn = QPushButton("Скрыть настройки")
         self.toggle_settings_btn.clicked.connect(self._toggle_settings_visible)
@@ -129,36 +145,58 @@ class LabelSettingsWidget(QWidget):
         layout.addLayout(toggle_row)
 
         self.settings_group = QGroupBox("Настройки (мм / пт)")
-        form = QFormLayout()
+        settings_layout = QVBoxLayout()
 
         self.spins = {}
-        field_defs = [
+
+        common_form = QFormLayout()
+        self._add_spin_rows(common_form, [
             ("label_w_mm", "Ширина этикетки, мм", 20, 200),
             ("label_h_mm", "Высота этикетки, мм", 20, 200),
             ("margin_mm", "Отступ от края, мм", 0, 20),
+            ("min_font_size", "Мин. размер шрифта при сжатии, пт", 4, 20),
+        ])
+        settings_layout.addLayout(common_form)
+
+        # поля своего типа этикетки показываются, чужого - прячутся:
+        # для QR настройки штрихкода ничего не значат, и наоборот
+        self.barcode_group = QGroupBox("Штрихкод Code128")
+        barcode_form = QFormLayout()
+        self._add_spin_rows(barcode_form, [
             ("barcode_y", "Штрихкод: отступ снизу, мм", 0, 100),
             ("barcode_h", "Штрихкод: высота, мм", 5, 60),
             ("code_y", "Текст кода: отступ снизу, мм", 0, 100),
             ("code_font_size", "Шрифт кода (базовый), пт", 4, 40),
             ("seq_font_size", "Шрифт номера (крупный), пт", 4, 60),
             ("seq_digits", "Символов номера (крупным)", 1, 10),
-            ("min_font_size", "Мин. размер шрифта при сжатии, пт", 4, 20),
-        ]
-        for key, label, lo, hi in field_defs:
-            spin = NoScrollSpinBox()
-            spin.setRange(lo, hi)
-            spin.setValue(int(self.settings.get(key, DEFAULT_LABEL_SETTINGS[key])))
-            spin.valueChanged.connect(self._on_setting_changed)
-            self.spins[key] = spin
-            form.addRow(label, spin)
+        ])
+        self.barcode_group.setLayout(barcode_form)
+        settings_layout.addWidget(self.barcode_group)
+
+        self.qr_group = QGroupBox("QR-код")
+        qr_form = QFormLayout()
+        self._add_spin_rows(qr_form, [
+            ("qr_size_mm", "Размер QR (сторона), мм", 8, 100),
+            ("qr_x", "QR: отступ слева, мм", 0, 100),
+            ("qr_y", "QR: отступ снизу, мм", 0, 100),
+            ("qr_code_y", "Подпись кода: отступ снизу, мм", 0, 100),
+            ("qr_code_font_size", "Шрифт подписи кода, пт", 4, 30),
+        ])
+        self.qr_show_code_checkbox = QCheckBox("Печатать код текстом под QR")
+        self.qr_show_code_checkbox.setChecked(bool(self.settings.get("qr_show_code", 1)))
+        self.qr_show_code_checkbox.stateChanged.connect(self._on_setting_changed)
+        qr_form.addRow(self.qr_show_code_checkbox)
+        self.qr_group.setLayout(qr_form)
+        settings_layout.addWidget(self.qr_group)
 
         self.grid_checkbox = QCheckBox("Показывать сетку на превью")
         self.grid_checkbox.setChecked(bool(self.settings.get("show_grid", 1)))
         self.grid_checkbox.stateChanged.connect(self._on_setting_changed)
-        form.addRow(self.grid_checkbox)
+        settings_layout.addWidget(self.grid_checkbox)
 
-        self.settings_group.setLayout(form)
+        self.settings_group.setLayout(settings_layout)
         layout.addWidget(self.settings_group)
+        self._apply_type_visibility()
 
         btn_row = QHBoxLayout()
         save_btn = QPushButton("Сохранить настройки")
@@ -175,6 +213,20 @@ class LabelSettingsWidget(QWidget):
         undo_shortcut.activated.connect(self._undo)
 
         self.refresh_preview()
+
+    def _add_spin_rows(self, form, field_defs):
+        for key, label, lo, hi in field_defs:
+            spin = NoScrollSpinBox()
+            spin.setRange(lo, hi)
+            spin.setValue(int(self.settings.get(key, DEFAULT_LABEL_SETTINGS[key])))
+            spin.valueChanged.connect(self._on_setting_changed)
+            self.spins[key] = spin
+            form.addRow(label, spin)
+
+    def _apply_type_visibility(self):
+        is_qr = self.settings.get("label_type") == "qr"
+        self.barcode_group.setVisible(not is_qr)
+        self.qr_group.setVisible(is_qr)
 
     def _push_undo_snapshot(self):
         if self._suppress_undo_snapshot:
@@ -197,6 +249,7 @@ class LabelSettingsWidget(QWidget):
         for key, spin in self.spins.items():
             self.settings[key] = spin.value()
         self.settings["show_grid"] = 1 if self.grid_checkbox.isChecked() else 0
+        self.settings["qr_show_code"] = 1 if self.qr_show_code_checkbox.isChecked() else 0
         self.refresh_preview()
 
     def _apply_settings_to_form(self):
@@ -207,16 +260,65 @@ class LabelSettingsWidget(QWidget):
         self.grid_checkbox.blockSignals(True)
         self.grid_checkbox.setChecked(bool(self.settings.get("show_grid", 1)))
         self.grid_checkbox.blockSignals(False)
+        self.qr_show_code_checkbox.blockSignals(True)
+        self.qr_show_code_checkbox.setChecked(bool(self.settings.get("qr_show_code", 1)))
+        self.qr_show_code_checkbox.blockSignals(False)
+        self._sync_type_combo()
+        self._apply_type_visibility()
+
+    def _sync_type_combo(self):
+        idx = self.type_combo.findData(self.settings.get("label_type", "barcode"))
+        if idx >= 0:
+            self.type_combo.blockSignals(True)
+            self.type_combo.setCurrentIndex(idx)
+            self.type_combo.blockSignals(False)
 
     def _on_type_changed(self):
         self._push_undo_snapshot()
         self.settings["label_type"] = self.type_combo.currentData()
+        self._apply_type_visibility()
         self.refresh_preview()
+
+    def _qr_content_for(self, code: str) -> str | None:
+        if self.settings.get("label_type") != "qr" or self.qr_content_provider is None:
+            return None
+        try:
+            return self.qr_content_provider(code)
+        except Exception:
+            return None
+
+    def _refresh_qr_density(self, qr_content: str | None):
+        if self.settings.get("label_type") != "qr":
+            self.qr_density_label.setVisible(False)
+            return
+
+        size_mm = float(self.settings.get("qr_size_mm", DEFAULT_LABEL_SETTINGS["qr_size_mm"]))
+        try:
+            d = qr_density(qr_content, size_mm)
+        except Exception:
+            self.qr_density_label.setVisible(False)
+            return
+
+        text = (f"Плотность QR: {d['modules']}×{d['modules']} модулей, "
+                f"{d['mm_per_module']:.2f} мм на модуль "
+                f"({d['dots_per_module']:.1f} точки при 203 dpi)")
+        if d["ok"]:
+            self.qr_density_label.setStyleSheet("")
+        else:
+            text += (f" — мелко для термопечати (нужно от {MIN_MODULE_MM} мм и "
+                     f"{MIN_DOTS_PER_MODULE:.0f} точек). Увеличьте размер QR "
+                     f"или сократите названия разделов.")
+            self.qr_density_label.setStyleSheet("color: #c0392b; font-weight: bold;")
+        self.qr_density_label.setText(text)
+        self.qr_density_label.setVisible(True)
 
     def refresh_preview(self):
         code = self.test_code_input.text().strip() or TEST_CODE_DEFAULT
+        qr_content = self._qr_content_for(code)
+        self._refresh_qr_density(qr_content if qr_content is not None else code)
         try:
-            img = render_preview_image(code, self.settings, self.font_name, px_per_mm=8)
+            img = render_preview_image(code, self.settings, self.font_name, px_per_mm=8,
+                                       qr_content=qr_content)
         except Exception as e:
             self.preview_label.setText(f"Ошибка превью: {e}")
             return
@@ -280,7 +382,9 @@ class LabelSettingsWidget(QWidget):
         if not path:
             return
         try:
-            make_pdf_one_per_page([code], path, self.settings, self.font_name)
+            qr_content = self._qr_content_for(code)
+            qr_contents = [qr_content] if qr_content is not None else None
+            make_pdf_one_per_page([code], path, self.settings, self.font_name, qr_contents=qr_contents)
             QMessageBox.information(self, "Готово", f"Тестовая этикетка сохранена: {path}")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", str(e))

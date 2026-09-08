@@ -35,6 +35,16 @@ PDF_FONT_NAME = "LabelFont"
 SETTINGS_FILE = get_app_data_dir() / "label_settings.json"
 PRESETS_FILE = get_app_data_dir() / "label_presets.json"
 
+# Уровень коррекции ошибок QR: M = 15% (запас на потёртости и грязь
+# на складе). Выше (Q/H) - заметно плотнее при том же размере.
+QR_ERROR_LEVEL = "M"
+
+# Порог печатаемости QR. Ниже него модули на термопринтере сливаются,
+# и сканер читает через раз. 203 dpi - типовой складской принтер.
+DOTS_PER_MM_203DPI = 203 / 25.4
+MIN_MODULE_MM = 0.33
+MIN_DOTS_PER_MODULE = 3.0
+
 FONT_CANDIDATES = [
     r"C:\Windows\Fonts\arial.ttf",
     r"C:\Windows\Fonts\segoeui.ttf",
@@ -203,15 +213,55 @@ def draw_barcode_pdf(c: canvas.Canvas, code: str, settings: dict):
 
     img = _render_barcode_bars_pil(code, w_px, h_px)
     c.drawImage(ImageReader(img), margin, y, width=w_mm * mm, height=h_mm * mm)
+def _qr_widget(qr_content: str):
+    """QrCodeWidget с уровнем коррекции QR_ERROR_LEVEL.
+
+    Уровень ОБЯЗАН передаваться в конструктор: QrCodeWidget читает
+    barLevel один раз, когда создаёт внутренний QRCode, и своего
+    __setattr__ у него нет. Присваивание qr.barLevel уже после
+    конструктора молча не действует - код печатался бы уровнем L
+    (7% коррекции) вместо M (15%), никак об этом не сообщая.
+    """
+    from reportlab.graphics.barcode.qr import QrCodeWidget
+
+    return QrCodeWidget(qr_content, barLevel=QR_ERROR_LEVEL)
+
+
+def qr_module_count(qr_content: str) -> int:
+    """Число модулей (клеток) в QR со стороны - растёт вместе с объёмом
+    содержимого. Считается тем же путём, что и при печати, поэтому
+    оценка плотности не может разойтись с реальной этикеткой."""
+    qr = _qr_widget(qr_content)
+    qr.qr.make()
+    return qr.qr.getModuleCount()
+
+
+def qr_density(qr_content: str, qr_size_mm: float, dots_per_mm: float = DOTS_PER_MM_203DPI) -> dict:
+    """Оценка печатаемости QR: сколько миллиметров и точек принтера
+    приходится на один модуль при заданном размере QR.
+
+    Практический порог - MIN_MODULE_MM на модуль и не меньше
+    MIN_DOTS_PER_MODULE точек принтера: ниже него термопринтер
+    начинает "слипать" модули, и сканер читает через раз.
+    """
+    modules = qr_module_count(qr_content)
+    mm_per_module = float(qr_size_mm) / modules
+    dots_per_module = mm_per_module * dots_per_mm
+    return {
+        "modules": modules,
+        "mm_per_module": mm_per_module,
+        "dots_per_module": dots_per_module,
+        "ok": mm_per_module >= MIN_MODULE_MM and dots_per_module >= MIN_DOTS_PER_MODULE,
+    }
+
+
 def draw_qr_pdf(c: canvas.Canvas, qr_content: str, settings: dict):
     """
     Рисует QR-код с содержимым qr_content в PDF-канвас.
     Позиция (qr_x, qr_y от нижнего-левого угла) и размер (qr_size_mm) —
-    из настроек. Уровень коррекции ошибок M (баланс читаемости и
-    плотности). По тому же принципу, что draw_barcode_pdf — прямо в
+    из настроек. По тому же принципу, что draw_barcode_pdf — прямо в
     канвас, чтобы превью (снимок PDF) совпало с печатью.
     """
-    from reportlab.graphics.barcode.qr import QrCodeWidget
     from reportlab.graphics.shapes import Drawing
     from reportlab.graphics import renderPDF
 
@@ -219,8 +269,7 @@ def draw_qr_pdf(c: canvas.Canvas, qr_content: str, settings: dict):
     x = float(settings.get("qr_x", 5)) * mm
     y = float(settings.get("qr_y", 10)) * mm
 
-    qr = QrCodeWidget(qr_content)
-    qr.barLevel = "M"
+    qr = _qr_widget(qr_content)
     bounds = qr.getBounds()
     qr_w = bounds[2] - bounds[0]
     qr_h = bounds[3] - bounds[1]
@@ -295,13 +344,19 @@ def make_pdf_one_per_page(codes, out_path, settings: dict, font_name: str, qr_co
     return Path(out_path) if is_path else out_path
 
 
-def render_preview_image(code: str, settings: dict, font_name: str, px_per_mm: int = 8):
+def render_preview_image(code: str, settings: dict, font_name: str, px_per_mm: int = 8,
+                         qr_content: str | None = None):
     """
     Рендер этикетки в PIL.Image для живого превью в GUI. Генерирует
     настоящий PDF в памяти и растеризует его через PyMuPDF - превью
     физически является снимком реального PDF. Сетка (шаг 5 мм) и рамка
     зоны отступов рисуются полупрозрачным слоем поверх - видны на белом
     фоне, но не перекрывают штрихкод/текст сплошным цветом.
+
+    qr_content - содержимое QR для превью. Его обязательно передавать
+    таким же, каким оно уйдёт в печать: от объёма содержимого зависит
+    плотность QR (число модулей), поэтому превью с одним лишь кодом
+    выглядело бы заметно реже реальной этикетки.
     """
     import fitz
     from PIL import Image, ImageDraw, ImageFont
@@ -309,8 +364,8 @@ def render_preview_image(code: str, settings: dict, font_name: str, px_per_mm: i
     buf = io.BytesIO()
     qr_contents = None
     if settings.get("label_type") == "qr":
-        # для превью QR: если готового содержимого нет, показываем сам код
-        qr_contents = [code]
+        # запасной путь: без готового содержимого показываем сам код
+        qr_contents = [qr_content if qr_content is not None else code]
     make_pdf_one_per_page([code], buf, settings, font_name, qr_contents=qr_contents)
     buf.seek(0)
 

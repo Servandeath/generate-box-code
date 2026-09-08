@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 from pathlib import Path
 
@@ -6,8 +6,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from label_render import (
     make_pdf_one_per_page,
     DEFAULT_LABEL_SETTINGS,
+    MIN_DOTS_PER_MODULE,
+    MIN_MODULE_MM,
+    QR_ERROR_LEVEL,
     register_pdf_font,
+    qr_density,
+    qr_module_count,
     _fit_font_sizes,
+    _qr_widget,
 )
 
 
@@ -65,3 +71,59 @@ def test_fit_font_sizes_splits_prefix_and_seq_correctly():
 
     assert prefix == "MAN_16_07_2026_DE_BT_R4N"
     assert seq_part == "001"
+
+
+CODE = "MAN_16_07_2026_DE_BT_R4N001"
+LONG_CONTENT = CODE + "\n" + "\n".join([
+    "Кабинет продавца: Альфа-Премиум",
+    "Дата: 16_07_2026",
+    "Сезон коллекции: Лето-Осень",
+    "Категория товара: Обувь женская",
+    "Номер: 001",
+])
+
+
+def test_qr_uses_declared_error_correction_level():
+    # уровень должен попадать в конструктор: присвоение barLevel после
+    # создания виджета молча не действует, и QR печатался бы уровнем L
+    from reportlab.graphics.barcode.qr import QrCodeWidget
+
+    ours = qr_module_count(LONG_CONTENT)
+
+    declared = QrCodeWidget(LONG_CONTENT, barLevel=QR_ERROR_LEVEL)
+    declared.qr.make()
+    assert ours == declared.qr.getModuleCount()
+
+    ignored_level = QrCodeWidget(LONG_CONTENT)
+    ignored_level.barLevel = QR_ERROR_LEVEL
+    ignored_level.qr.make()
+    assert ours != ignored_level.qr.getModuleCount()
+
+
+def test_qr_module_count_grows_with_content():
+    assert qr_module_count(CODE) < qr_module_count(LONG_CONTENT)
+
+
+def test_qr_density_ok_for_default_size_and_short_content():
+    d = qr_density(CODE, DEFAULT_LABEL_SETTINGS["qr_size_mm"])
+    assert d["ok"]
+    assert d["mm_per_module"] >= MIN_MODULE_MM
+    assert d["dots_per_module"] >= MIN_DOTS_PER_MODULE
+
+
+def test_qr_density_flags_too_dense_content():
+    assert not qr_density(LONG_CONTENT, DEFAULT_LABEL_SETTINGS["qr_size_mm"])["ok"]
+
+
+def test_qr_density_recovers_when_qr_enlarged():
+    # ровно тот выход, который предлагает предупреждение в интерфейсе
+    assert qr_density(LONG_CONTENT, 26)["ok"]
+
+
+def test_qr_density_matches_printed_label():
+    # индикатор обязан считать по тому же пути, что и печать
+    settings = DEFAULT_LABEL_SETTINGS.copy()
+    settings["label_type"] = "qr"
+    printed = _qr_widget(LONG_CONTENT)
+    printed.qr.make()
+    assert qr_density(LONG_CONTENT, 22)["modules"] == printed.qr.getModuleCount()
