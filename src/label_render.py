@@ -45,6 +45,10 @@ DOTS_PER_MM_203DPI = 203 / 25.4
 MIN_MODULE_MM = 0.33
 MIN_DOTS_PER_MODULE = 3.0
 
+# Мельче кириллица на 203 dpi читается с трудом: при 6 пт строчные буквы
+# около 1.1 мм - это примерно 9 точек принтера.
+MIN_READABLE_TEXT_PT = 6
+
 FONT_CANDIDATES = [
     r"C:\Windows\Fonts\arial.ttf",
     r"C:\Windows\Fonts\segoeui.ttf",
@@ -80,6 +84,9 @@ DEFAULT_LABEL_SETTINGS = {
     "qr_show_code": 1,
     "qr_code_y": 4,
     "qr_code_font_size": 7,
+    "qr_text_show": 1,
+    "qr_text_font_size": 7,
+    "qr_text_gap_mm": 2,
 
     "label_type": "barcode",
 }
@@ -294,6 +301,104 @@ def draw_qr_code_label(c: canvas.Canvas, code: str, settings: dict, font_name: s
     c.setFont(font_name, fs)
     c.drawString(x, y, code)
 
+def _truncate_to_width(text: str, max_width: float, font_name: str, font_size: int) -> str:
+    """Обрезает строку под ширину, добавляя многоточие. Нужно на случай,
+    когда даже минимальный шрифт не спасает: лучше усечённая строка, чем
+    заезжающая за край этикетки."""
+    if pdfmetrics.stringWidth(text, font_name, font_size) <= max_width:
+        return text
+    ellipsis = "…"
+    cut = text
+    while cut and pdfmetrics.stringWidth(cut + ellipsis, font_name, font_size) > max_width:
+        cut = cut[:-1]
+    return (cut + ellipsis) if cut else ""
+
+
+def fit_text_block(lines, max_width: float, max_height: float, start_font_size: int,
+                   min_font_size: int, font_name: str, leading_ratio: float = 1.25):
+    """Подбирает размер шрифта, при котором блок строк влезает и по
+    ширине, и по высоте. Возвращает (размер шрифта, высота строки) в пунктах.
+    Логика та же, что у _fit_font_sizes для кода: уменьшаем, пока не
+    поместится, но не ниже min_font_size."""
+    fs = int(start_font_size)
+    while fs > int(min_font_size):
+        widest = max(pdfmetrics.stringWidth(line, font_name, fs) for line in lines)
+        if widest <= max_width and len(lines) * fs * leading_ratio <= max_height:
+            break
+        fs -= 1
+    return fs, fs * leading_ratio
+
+
+def qr_text_layout(qr_content: str, settings: dict, font_name: str) -> dict | None:
+    """Раскладка расшифровки справа от QR. Общая для печати и подсказки
+    в интерфейсе, чтобы предупреждение не разошлось с этикеткой.
+    None - если выводить нечего (в содержимом только сам код)."""
+    # первая строка - сам код короба, он уже печатается подписью под QR
+    lines = [line for line in qr_content.splitlines()[1:] if line.strip()]
+    if not lines:
+        return None
+
+    qr_x = float(settings.get("qr_x", 5))
+    qr_size = float(settings.get("qr_size_mm", 22))
+    gap = float(settings.get("qr_text_gap_mm", 2))
+    margin = float(settings["margin_mm"])
+
+    x = (qr_x + qr_size + gap) * mm
+    max_width = (float(settings["label_w_mm"]) - margin) * mm - x
+    if max_width <= 0:
+        return {"x": x, "font_size": 0, "placed": [], "truncated": 0,
+                "dropped": len(lines), "ok": False}
+
+    # высота колонки не привязана к QR: иначе маленький QR ужимал бы и текст
+    top = (float(settings["label_h_mm"]) - margin) * mm
+    if int(settings.get("qr_show_code", 1)):
+        # зазор 2 мм над подписью кода, иначе нижняя строка сливается с ней
+        bottom = (float(settings.get("qr_code_y", 4)) + 2) * mm + int(settings.get("qr_code_font_size", 7))
+    else:
+        bottom = margin * mm
+
+    fs, line_height = fit_text_block(
+        lines, max_width, top - bottom,
+        int(settings.get("qr_text_font_size", 7)),
+        int(settings.get("min_font_size", 4)),
+        font_name,
+    )
+
+    # вровень с верхом QR, а если оттуда не влезает - выше, но не выше края
+    qr_top = (float(settings.get("qr_y", 10)) + qr_size) * mm
+    needed = fs + (len(lines) - 1) * line_height
+    y = min(top, max(qr_top, bottom + needed)) - fs
+
+    placed = []
+    for line in lines:
+        if y < bottom - 0.01:  # допуск на погрешность float при точной подгонке
+            break
+        placed.append((_truncate_to_width(line, max_width, font_name, fs), y))
+        y -= line_height
+
+    truncated = sum(1 for (text, _), source in zip(placed, lines) if text != source)
+    dropped = len(lines) - len(placed)
+    return {
+        "x": x,
+        "font_size": fs,
+        "placed": placed,
+        "truncated": truncated,
+        "dropped": dropped,
+        "ok": fs >= MIN_READABLE_TEXT_PT and not truncated and not dropped,
+    }
+
+
+def draw_qr_text_block(c: canvas.Canvas, qr_content: str, settings: dict, font_name: str):
+    """Расшифровка QR обычным текстом справа от QR - прочитать короб
+    глазами, не доставая сканер (галочка qr_text_show)."""
+    layout = qr_text_layout(qr_content, settings, font_name)
+    if not layout or not layout["placed"]:
+        return
+    c.setFont(font_name, layout["font_size"])
+    for text, y in layout["placed"]:
+        c.drawString(layout["x"], y, text)
+
+
 def draw_code_text(c: canvas.Canvas, code: str, settings: dict, font_name: str):
     code_fs, seq_fs, prefix, seq_part = _fit_font_sizes(code, settings, font_name)
 
@@ -312,7 +417,7 @@ def draw_code_text(c: canvas.Canvas, code: str, settings: dict, font_name: str):
 def draw_label(c: canvas.Canvas, code: str, settings: dict, font_name: str, qr_content=None):
     """Рисует этикетку. Тип определяется settings['label_type']:
       'barcode' (по умолчанию) — Code128 + текст кода;
-      'qr'                      — QR + опциональная подпись кода снизу.
+      'qr'                      — QR, расшифровка справа и подпись кода снизу (обе опциональны).
     qr_content — готовая строка содержимого QR (собирается в GUI).
     При label_type='qr' без qr_content подставляется сам код (запасной путь).
     """
@@ -320,6 +425,8 @@ def draw_label(c: canvas.Canvas, code: str, settings: dict, font_name: str, qr_c
     if label_type == "qr":
         content = qr_content if qr_content is not None else code
         draw_qr_pdf(c, content, settings)
+        if int(settings.get("qr_text_show", 1)):
+            draw_qr_text_block(c, content, settings, font_name)
         if int(settings.get("qr_show_code", 1)):
             draw_qr_code_label(c, code, settings, font_name)
     else:

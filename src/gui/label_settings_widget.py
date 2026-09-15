@@ -21,14 +21,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from label_render import (
     DEFAULT_LABEL_SETTINGS,
-    MIN_DOTS_PER_MODULE,
-    MIN_MODULE_MM,
+    MIN_READABLE_TEXT_PT,
     load_label_settings,
     save_label_settings,
     render_preview_image,
     register_pdf_font,
     make_pdf_one_per_page,
     qr_density,
+    qr_text_layout,
     load_presets,
     save_preset,
     delete_preset,
@@ -123,14 +123,12 @@ class LabelSettingsWidget(QWidget):
         self.preview_label.setStyleSheet("background-color: #eeeeee; border: 1px solid #999;")
         layout.addWidget(self.preview_label)
 
-        # плотность QR: сколько миллиметров/точек принтера приходится на
-        # модуль. Объём расшифровки зависит от того, как клиент назвал
-        # разделы, поэтому цифра нужна прямо при настройке, а не после
-        # первой нечитаемой пачки этикеток
-        self.qr_density_label = QLabel()
-        self.qr_density_label.setWordWrap(True)
-        self.qr_density_label.setVisible(False)
-        layout.addWidget(self.qr_density_label)
+        # QR и расшифровка делят одно место на этикетке, поэтому их
+        # читаемость показывается одной строкой
+        self.qr_status_label = QLabel()
+        self.qr_status_label.setWordWrap(True)
+        self.qr_status_label.setVisible(False)
+        layout.addWidget(self.qr_status_label)
 
         toggle_row = QHBoxLayout()
         self.toggle_settings_btn = QPushButton("Скрыть настройки")
@@ -181,11 +179,22 @@ class LabelSettingsWidget(QWidget):
             ("qr_y", "QR: отступ снизу, мм", 0, 100),
             ("qr_code_y", "Подпись кода: отступ снизу, мм", 0, 100),
             ("qr_code_font_size", "Шрифт подписи кода, пт", 4, 30),
+            ("qr_text_font_size", "Шрифт расшифровки, пт", 4, 30),
+            ("qr_text_gap_mm", "Отступ расшифровки от QR, мм", 0, 30),
         ])
         self.qr_show_code_checkbox = QCheckBox("Печатать код текстом под QR")
         self.qr_show_code_checkbox.setChecked(bool(self.settings.get("qr_show_code", 1)))
         self.qr_show_code_checkbox.stateChanged.connect(self._on_setting_changed)
         qr_form.addRow(self.qr_show_code_checkbox)
+
+        self.qr_text_show_checkbox = QCheckBox("Печатать расшифровку справа от QR")
+        self.qr_text_show_checkbox.setToolTip(
+            "Разделы, дата и номер обычным текстом - чтобы прочитать\n"
+            "короб глазами, не доставая сканер"
+        )
+        self.qr_text_show_checkbox.setChecked(bool(self.settings.get("qr_text_show", 1)))
+        self.qr_text_show_checkbox.stateChanged.connect(self._on_setting_changed)
+        qr_form.addRow(self.qr_text_show_checkbox)
         self.qr_group.setLayout(qr_form)
         settings_layout.addWidget(self.qr_group)
 
@@ -250,6 +259,7 @@ class LabelSettingsWidget(QWidget):
             self.settings[key] = spin.value()
         self.settings["show_grid"] = 1 if self.grid_checkbox.isChecked() else 0
         self.settings["qr_show_code"] = 1 if self.qr_show_code_checkbox.isChecked() else 0
+        self.settings["qr_text_show"] = 1 if self.qr_text_show_checkbox.isChecked() else 0
         self.refresh_preview()
 
     def _apply_settings_to_form(self):
@@ -263,6 +273,9 @@ class LabelSettingsWidget(QWidget):
         self.qr_show_code_checkbox.blockSignals(True)
         self.qr_show_code_checkbox.setChecked(bool(self.settings.get("qr_show_code", 1)))
         self.qr_show_code_checkbox.blockSignals(False)
+        self.qr_text_show_checkbox.blockSignals(True)
+        self.qr_text_show_checkbox.setChecked(bool(self.settings.get("qr_text_show", 1)))
+        self.qr_text_show_checkbox.blockSignals(False)
         self._sync_type_combo()
         self._apply_type_visibility()
 
@@ -287,35 +300,59 @@ class LabelSettingsWidget(QWidget):
         except Exception:
             return None
 
-    def _refresh_qr_density(self, qr_content: str | None):
+    def _refresh_qr_status(self, qr_content: str):
         if self.settings.get("label_type") != "qr":
-            self.qr_density_label.setVisible(False)
+            self.qr_status_label.setVisible(False)
             return
 
         size_mm = float(self.settings.get("qr_size_mm", DEFAULT_LABEL_SETTINGS["qr_size_mm"]))
         try:
-            d = qr_density(qr_content, size_mm)
+            density = qr_density(qr_content, size_mm)
+            text_layout = None
+            if int(self.settings.get("qr_text_show", 1)):
+                text_layout = qr_text_layout(qr_content, self.settings, self.font_name)
         except Exception:
-            self.qr_density_label.setVisible(False)
+            self.qr_status_label.setVisible(False)
             return
 
-        text = (f"Плотность QR: {d['modules']}×{d['modules']} модулей, "
-                f"{d['mm_per_module']:.2f} мм на модуль "
-                f"({d['dots_per_module']:.1f} точки при 203 dpi)")
-        if d["ok"]:
-            self.qr_density_label.setStyleSheet("")
+        qr_ok = density["ok"]
+        parts = [f"QR: {density['mm_per_module']:.2f} мм на модуль — {'норма' if qr_ok else 'мелко'}"]
+        text_ok = True
+        if text_layout is not None:
+            text_ok = text_layout["ok"]
+            parts.append(self._describe_text_layout(text_layout))
+
+        # размер QR тянет в разные стороны: крупнее QR - мельче текст
+        if not qr_ok and not text_ok:
+            hint = "Увеличьте этикетку или сократите названия разделов"
+        elif not qr_ok:
+            hint = "Увеличьте QR или этикетку, либо сократите названия разделов"
+        elif not text_ok:
+            hint = "Уменьшите QR или увеличьте этикетку, либо сократите названия разделов"
         else:
-            text += (f" — мелко для термопечати (нужно от {MIN_MODULE_MM} мм и "
-                     f"{MIN_DOTS_PER_MODULE:.0f} точек). Увеличьте размер QR "
-                     f"или сократите названия разделов.")
-            self.qr_density_label.setStyleSheet("color: #c0392b; font-weight: bold;")
-        self.qr_density_label.setText(text)
-        self.qr_density_label.setVisible(True)
+            hint = ""
+
+        self.qr_status_label.setText(" · ".join(parts) + (f"\n{hint}" if hint else ""))
+        self.qr_status_label.setStyleSheet("color: #c0392b; font-weight: bold;" if hint else "")
+        self.qr_status_label.setVisible(True)
+
+    @staticmethod
+    def _describe_text_layout(layout: dict) -> str:
+        if not layout["placed"]:
+            return "Текст: не помещается"
+        issues = []
+        if layout["font_size"] < MIN_READABLE_TEXT_PT:
+            issues.append("мелко")
+        if layout["truncated"]:
+            issues.append(f"обрезано строк: {layout['truncated']}")
+        if layout["dropped"]:
+            issues.append(f"не влезло строк: {layout['dropped']}")
+        return f"Текст: {layout['font_size']} пт — " + (", ".join(issues) if issues else "норма")
 
     def refresh_preview(self):
         code = self.test_code_input.text().strip() or TEST_CODE_DEFAULT
         qr_content = self._qr_content_for(code)
-        self._refresh_qr_density(qr_content if qr_content is not None else code)
+        self._refresh_qr_status(qr_content if qr_content is not None else code)
         try:
             img = render_preview_image(code, self.settings, self.font_name, px_per_mm=8,
                                        qr_content=qr_content)
