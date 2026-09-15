@@ -20,10 +20,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from db import list_active, get_next_seq, code_exists, add_box_code
 from generate_box_code import generate_box_code, format_seq, DATE_FORMATS, DEFAULT_DATE_FORMAT, DEFAULT_BLOCK_ORDER
-from label_render import make_pdf_one_per_page, load_label_settings, register_pdf_font
+from label_render import make_pdf_bytes, register_pdf_font
 from dimension_labels import load_dimension_labels
 from qr_content import build_qr_content
 from gui.label_settings_widget import LabelSettingsWidget
+from gui.print_types_widget import PrintTypesWidget
+from gui.printing import print_pdf_with_dialog
 
 from openpyxl import Workbook
 
@@ -225,9 +227,16 @@ class GeneratorTab(QWidget):
 
         export_container = QWidget()
         export_layout = QVBoxLayout(export_container)
+        self.print_types = PrintTypesWidget()
+        export_layout.addWidget(self.print_types)
         export_row = QHBoxLayout()
+        self.print_btn = QPushButton("Печать...")
+        self.print_btn.setToolTip("Печать на принтер выделенных строк; если ничего не выделено - последнего сгенерированного пакета")
+        self.print_btn.clicked.connect(self._print_labels)
+        self.print_btn.setEnabled(False)
+        export_row.addWidget(self.print_btn)
         self.pdf_btn = QPushButton("Сохранить PDF")
-        self.pdf_btn.setToolTip("Печатает выделенные строки; если ничего не выделено - последний сгенерированный пакет")
+        self.pdf_btn.setToolTip("Сохраняет в PDF выделенные строки; если ничего не выделено - последний сгенерированный пакет")
         self.pdf_btn.clicked.connect(self._save_pdf)
         self.pdf_btn.setEnabled(False)
         self.excel_btn = QPushButton("Экспорт в Excel")
@@ -491,6 +500,7 @@ class GeneratorTab(QWidget):
 
         self._last_batch = codes
         has_rows = self.table.rowCount() > 0
+        self.print_btn.setEnabled(has_rows)
         self.pdf_btn.setEnabled(has_rows)
         self.excel_btn.setEnabled(has_rows)
 
@@ -509,6 +519,12 @@ class GeneratorTab(QWidget):
             meta["values_ru"], meta["date_str"], format_seq(meta["seq"]),
         )
 
+    def _labels_pdf(self, codes: list[str]) -> bytes:
+        types = self.print_types.types()
+        qr_contents = [self._qr_content_for_code(code) for code in codes] if "qr" in types else None
+        return make_pdf_bytes(codes, self.label_settings.settings, self._pdf_font_name,
+                              qr_contents=qr_contents, label_types=types)
+
     def _save_pdf(self):
         codes = self._get_export_codes()
         if not codes:
@@ -517,14 +533,21 @@ class GeneratorTab(QWidget):
         if not path:
             return
         try:
-            settings = load_label_settings()
-            qr_contents = None
-            if settings.get("label_type") == "qr":
-                qr_contents = [self._qr_content_for_code(code) for code in codes]
-            make_pdf_one_per_page(codes, path, settings, self._pdf_font_name, qr_contents=qr_contents)
-            QMessageBox.information(self, "Готово", f"Этикетки сохранены ({len(codes)} шт.): {path}")
+            with open(path, "wb") as f:
+                f.write(self._labels_pdf(codes))
+            QMessageBox.information(self, "Готово", f"Этикетки сохранены (кодов: {len(codes)}): {path}")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", str(e))
+
+    def _print_labels(self):
+        codes = self._get_export_codes()
+        if not codes:
+            return
+        settings = self.label_settings.settings
+        try:
+            print_pdf_with_dialog(self, self._labels_pdf(codes), settings["label_w_mm"], settings["label_h_mm"])
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка печати", str(e))
 
     def _save_excel(self):
         codes = self._get_export_codes()

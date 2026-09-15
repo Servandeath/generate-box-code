@@ -13,4 +13,5 @@ src/label_presets.json
 src/dimension_labels.json
 src/dimension_label_presets.json
 src/theme.json
+src/print_options.json
 *.pdf

@@ -34,6 +34,7 @@ from app_paths import get_app_data_dir
 PDF_FONT_NAME = "LabelFont"
 SETTINGS_FILE = get_app_data_dir() / "label_settings.json"
 PRESETS_FILE = get_app_data_dir() / "label_presets.json"
+PRINT_OPTIONS_FILE = get_app_data_dir() / "print_options.json"
 
 # Уровень коррекции ошибок QR: M = 15% (запас на потёртости и грязь
 # на складе). Выше (Q/H) - заметно плотнее при том же размере.
@@ -434,9 +435,41 @@ def draw_label(c: canvas.Canvas, code: str, settings: dict, font_name: str, qr_c
         draw_code_text(c, code, settings, font_name)
 
 
-def make_pdf_one_per_page(codes, out_path, settings: dict, font_name: str, qr_contents=None):
+# порядок страниц на один код, когда печатаются оба типа
+LABEL_TYPES = ("barcode", "qr")
+
+
+def load_print_types() -> tuple[str, ...]:
+    """Что печатать - ШК, QR или оба. Выбор общий для генератора и истории
+    и запоминается между запусками; по умолчанию штрихкод."""
+    if PRINT_OPTIONS_FILE.exists():
+        try:
+            with open(PRINT_OPTIONS_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f).get("types", [])
+            types = tuple(t for t in LABEL_TYPES if t in saved)
+            if types:
+                return types
+        except Exception:
+            pass
+    return ("barcode",)
+
+
+def save_print_types(types) -> None:
+    with open(PRINT_OPTIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"types": [t for t in LABEL_TYPES if t in types]}, f, ensure_ascii=False, indent=2)
+
+
+def make_pdf_one_per_page(codes, out_path, settings: dict, font_name: str, qr_contents=None,
+                          label_types=None):
+    """По странице на этикетку. label_types - какие этикетки на каждый код;
+    при обоих типах страницы идут по коробу: ШК, затем QR. Без label_types
+    берётся settings['label_type'] - так печатают превью и тестовая печать."""
     w = float(settings["label_w_mm"]) * mm
     h = float(settings["label_h_mm"]) * mm
+    if label_types:
+        types = [t for t in LABEL_TYPES if t in label_types]
+    else:
+        types = [settings.get("label_type", "barcode")]
 
     is_path = isinstance(out_path, (str, Path))
     target = str(out_path) if is_path else out_path
@@ -444,11 +477,19 @@ def make_pdf_one_per_page(codes, out_path, settings: dict, font_name: str, qr_co
     c = canvas.Canvas(target, pagesize=(w, h))
     for i, code in enumerate(codes):
         qc = qr_contents[i] if qr_contents is not None and i < len(qr_contents) else None
-        draw_label(c, code, settings, font_name, qr_content=qc)
-        c.showPage()
+        for label_type in types:
+            draw_label(c, code, {**settings, "label_type": label_type}, font_name, qr_content=qc)
+            c.showPage()
     c.save()
 
     return Path(out_path) if is_path else out_path
+
+
+def make_pdf_bytes(codes, settings: dict, font_name: str, qr_contents=None, label_types=None) -> bytes:
+    """Тот же PDF в памяти - для печати на принтер и записи в файл."""
+    buf = io.BytesIO()
+    make_pdf_one_per_page(codes, buf, settings, font_name, qr_contents=qr_contents, label_types=label_types)
+    return buf.getvalue()
 
 
 def render_preview_image(code: str, settings: dict, font_name: str, px_per_mm: int = 8,

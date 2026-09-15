@@ -26,7 +26,7 @@ from label_render import (
     save_label_settings,
     render_preview_image,
     register_pdf_font,
-    make_pdf_one_per_page,
+    make_pdf_bytes,
     qr_density,
     qr_text_layout,
     load_presets,
@@ -34,6 +34,7 @@ from label_render import (
     delete_preset,
     list_preset_names,
 )
+from gui.printing import print_pdf_with_dialog
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
@@ -105,7 +106,7 @@ class LabelSettingsWidget(QWidget):
         layout.addLayout(test_row)
 
         type_row = QHBoxLayout()
-        type_row.addWidget(QLabel("Тип этикетки:"))
+        type_row.addWidget(QLabel("Настроить этикетку:"))
         self.type_combo = QComboBox()
         self.type_combo.addItem("Штрихкод (Code128)", "barcode")
         self.type_combo.addItem("QR-код", "qr")
@@ -210,11 +211,15 @@ class LabelSettingsWidget(QWidget):
         btn_row = QHBoxLayout()
         save_btn = QPushButton("Сохранить настройки")
         save_btn.clicked.connect(self._save_settings)
-        print_test_btn = QPushButton("Печать тестовая")
-        print_test_btn.setToolTip("Печать тестовая (1 этикетка)")
+        print_test_btn = QPushButton("Печать тестовая...")
+        print_test_btn.setToolTip("Одна этикетка с тестовым кодом на принтер - проверить настройки вживую")
         print_test_btn.clicked.connect(self._print_test)
+        pdf_test_btn = QPushButton("Тестовый PDF")
+        pdf_test_btn.setToolTip("Одна этикетка с тестовым кодом в PDF-файл")
+        pdf_test_btn.clicked.connect(self._save_test_pdf)
         btn_row.addWidget(save_btn)
         btn_row.addWidget(print_test_btn)
+        btn_row.addWidget(pdf_test_btn)
         layout.addLayout(btn_row)
         layout.addStretch()
 
@@ -413,15 +418,27 @@ class LabelSettingsWidget(QWidget):
             delete_preset(name)
             self._reload_presets_list()
 
-    def _print_test(self):
+    def _test_label_pdf(self) -> bytes:
+        # тестовая этикетка - того типа, что сейчас настраивается
         code = self.test_code_input.text().strip() or TEST_CODE_DEFAULT
-        path, _ = QFileDialog.getSaveFileName(self, "Тестовая печать", "test_label.pdf", "PDF files (*.pdf)")
+        qr_content = self._qr_content_for(code)
+        qr_contents = [qr_content] if qr_content is not None else None
+        return make_pdf_bytes([code], self.settings, self.font_name, qr_contents=qr_contents)
+
+    def _save_test_pdf(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Тестовый PDF", "test_label.pdf", "PDF files (*.pdf)")
         if not path:
             return
         try:
-            qr_content = self._qr_content_for(code)
-            qr_contents = [qr_content] if qr_content is not None else None
-            make_pdf_one_per_page([code], path, self.settings, self.font_name, qr_contents=qr_contents)
+            with open(path, "wb") as f:
+                f.write(self._test_label_pdf())
             QMessageBox.information(self, "Готово", f"Тестовая этикетка сохранена: {path}")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", str(e))
+
+    def _print_test(self):
+        try:
+            print_pdf_with_dialog(self, self._test_label_pdf(),
+                                  self.settings["label_w_mm"], self.settings["label_h_mm"])
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка печати", str(e))

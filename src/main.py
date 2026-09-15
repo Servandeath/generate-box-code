@@ -36,7 +36,12 @@ class MainWindow(QMainWindow):
 
         self.generator_tab = GeneratorTab(self.conn)
         self.references_tab = ReferencesTab(self.conn)
-        self.history_tab = HistoryTab(self.conn)
+        # перепечатка из истории идёт по тем же настройкам, что на экране генератора
+        self.history_tab = HistoryTab(self.conn, lambda: self.generator_tab.label_settings.settings)
+
+        # выбор «что печатать» общий для обеих вкладок
+        self.generator_tab.print_types.types_changed.connect(self.history_tab.print_types.set_types)
+        self.history_tab.print_types.types_changed.connect(self.generator_tab.print_types.set_types)
 
         self.settings_tab = SettingsTab()
         self.tabs.addTab(self.generator_tab, "Генератор")

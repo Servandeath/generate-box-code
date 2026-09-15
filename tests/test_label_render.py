@@ -265,3 +265,63 @@ def test_qr_text_layout_rises_above_low_qr_without_losing_lines():
     layout = qr_text_layout(QR_CONTENT, settings, register_pdf_font())
     assert layout["placed"][0][1] > _qr_top(settings) - layout["font_size"]
     assert layout["dropped"] == 0
+
+
+def _pdf_pages(path):
+    """(тип, текст) по страницам. Штрихкод вставлен в PDF картинкой, а QR
+    нарисован векторами - по этому и различаем тип этикетки."""
+    import fitz
+    with fitz.open(path) as doc:
+        return [("barcode" if page.get_images() else "qr", page.get_text()) for page in doc]
+
+
+def test_pdf_both_types_go_by_box_barcode_then_qr(tmp_path):
+    codes = ["ALF_16_07_2026_DE_BT_R4N001", "ALF_16_07_2026_DE_BT_X9Z002"]
+    out = tmp_path / "both.pdf"
+    # порядок в аргументе нарочно обратный - страницы всё равно ШК, затем QR
+    make_pdf_one_per_page(codes, out, DEFAULT_LABEL_SETTINGS, register_pdf_font(),
+                          qr_contents=[c + "\n" + "\n".join(DECODED) for c in codes],
+                          label_types=("qr", "barcode"))
+
+    pages = _pdf_pages(out)
+    assert [kind for kind, _ in pages] == ["barcode", "qr", "barcode", "qr"]
+    assert "R4N" in pages[0][1] and "R4N" in pages[1][1]
+    assert "X9Z" in pages[2][1] and "X9Z" in pages[3][1]
+
+
+def test_pdf_label_types_override_editor_type(tmp_path):
+    settings = DEFAULT_LABEL_SETTINGS.copy()
+    settings["label_type"] = "qr"
+    out = tmp_path / "barcode_only.pdf"
+    make_pdf_one_per_page(["ALF_16_07_2026_DE_BT_R4N001"], out, settings, register_pdf_font(),
+                          label_types=("barcode",))
+    assert [kind for kind, _ in _pdf_pages(out)] == ["barcode"]
+
+
+def test_pdf_without_label_types_uses_editor_type(tmp_path):
+    settings = DEFAULT_LABEL_SETTINGS.copy()
+    settings["label_type"] = "qr"
+    out = tmp_path / "editor_type.pdf"
+    make_pdf_one_per_page(["ALF_16_07_2026_DE_BT_R4N001"], out, settings, register_pdf_font())
+    assert [kind for kind, _ in _pdf_pages(out)] == ["qr"]
+
+
+def test_print_types_default_to_barcode_without_file(tmp_path, monkeypatch):
+    import label_render
+    monkeypatch.setattr(label_render, "PRINT_OPTIONS_FILE", tmp_path / "print_options.json")
+    assert label_render.load_print_types() == ("barcode",)
+
+
+def test_print_types_roundtrip_in_fixed_order(tmp_path, monkeypatch):
+    import label_render
+    monkeypatch.setattr(label_render, "PRINT_OPTIONS_FILE", tmp_path / "print_options.json")
+    label_render.save_print_types(("qr", "barcode"))
+    assert label_render.load_print_types() == ("barcode", "qr")
+
+
+def test_print_types_unknown_values_fall_back_to_barcode(tmp_path, monkeypatch):
+    import label_render
+    options = tmp_path / "print_options.json"
+    options.write_text('{"types": ["nonsense"]}', encoding="utf-8")
+    monkeypatch.setattr(label_render, "PRINT_OPTIONS_FILE", options)
+    assert label_render.load_print_types() == ("barcode",)

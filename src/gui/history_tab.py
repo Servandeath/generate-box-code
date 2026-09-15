@@ -23,9 +23,11 @@ import sqlite3
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from db import list_history
-from label_render import make_pdf_one_per_page, load_label_settings, register_pdf_font
+from label_render import make_pdf_bytes, register_pdf_font
 from dimension_labels import load_dimension_labels
 from qr_content import build_qr_content_from_history_row
+from gui.print_types_widget import PrintTypesWidget
+from gui.printing import print_pdf_with_dialog
 
 from openpyxl import Workbook
 
@@ -87,9 +89,11 @@ class HistoryTableModel(QAbstractTableModel):
 
 
 class HistoryTab(QWidget):
-    def __init__(self, conn: sqlite3.Connection, parent=None):
+    def __init__(self, conn: sqlite3.Connection, label_settings_source, parent=None):
         super().__init__(parent)
         self.conn = conn
+        # вызываемый объект, отдающий текущие (с экрана) настройки этикетки
+        self._label_settings_source = label_settings_source
         self._pdf_font_name = register_pdf_font()
 
         labels = load_dimension_labels()
@@ -133,14 +137,25 @@ class HistoryTab(QWidget):
         export_btn.clicked.connect(self._export_excel)
         side_layout.addWidget(export_btn)
 
-        reprint_btn = QPushButton("Перепечатать выбранный код")
-        reprint_btn.setToolTip(
+        reprint_group = QGroupBox("Перепечатать выбранный код")
+        reprint_group.setToolTip(
             "Печатает уже существующий код повторно - для случая, если\n"
             "физическая этикетка повреждена или потеряна. НЕ создаёт\n"
             "новый код, база не изменяется."
         )
-        reprint_btn.clicked.connect(self._reprint_selected)
-        side_layout.addWidget(reprint_btn)
+        reprint_layout = QVBoxLayout()
+        self.print_types = PrintTypesWidget()
+        reprint_layout.addWidget(self.print_types)
+        reprint_row = QHBoxLayout()
+        print_btn = QPushButton("Печать...")
+        print_btn.clicked.connect(self._print_selected)
+        pdf_btn = QPushButton("Сохранить PDF")
+        pdf_btn.clicked.connect(self._save_selected_pdf)
+        reprint_row.addWidget(print_btn)
+        reprint_row.addWidget(pdf_btn)
+        reprint_layout.addLayout(reprint_row)
+        reprint_group.setLayout(reprint_layout)
+        side_layout.addWidget(reprint_group)
 
         future_group = QGroupBox("Поиск и фильтры (в разработке)")
         future_layout = QVBoxLayout()
@@ -178,31 +193,44 @@ class HistoryTab(QWidget):
             return None
         return indexes[0].row()
 
-    def _reprint_selected(self):
+    def _selected_row(self):
         row_index = self._selected_row_index()
         if row_index is None:
             QMessageBox.information(self, "Внимание", "Выберите строку с кодом в таблице слева")
-            return
+            return None
+        return self.model.row_at(row_index)
 
-        row = self.model.row_at(row_index)
+    def _reprint_pdf(self, row) -> bytes:
+        types = self.print_types.types()
+        qr_contents = None
+        if "qr" in types:
+            qr_contents = [build_qr_content_from_history_row(row, load_dimension_labels())]
+        return make_pdf_bytes([row["code"]], self._label_settings_source(), self._pdf_font_name,
+                              qr_contents=qr_contents, label_types=types)
+
+    def _save_selected_pdf(self):
+        row = self._selected_row()
         if not row:
             return
-        code = row["code"]
-
-        path, _ = QFileDialog.getSaveFileName(self, "Перепечатать этикетку", f"{code}_reprint.pdf", "PDF files (*.pdf)")
+        path, _ = QFileDialog.getSaveFileName(self, "Перепечатать этикетку", f"{row['code']}_reprint.pdf", "PDF files (*.pdf)")
         if not path:
             return
-
         try:
-            settings = load_label_settings()
-            qr_contents = None
-            if settings.get("label_type") == "qr":
-                labels = load_dimension_labels()
-                qr_contents = [build_qr_content_from_history_row(row, labels)]
-            make_pdf_one_per_page([code], path, settings, self._pdf_font_name, qr_contents=qr_contents)
+            with open(path, "wb") as f:
+                f.write(self._reprint_pdf(row))
             QMessageBox.information(self, "Готово", f"Этикетка перепечатана: {path}")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", str(e))
+
+    def _print_selected(self):
+        row = self._selected_row()
+        if not row:
+            return
+        settings = self._label_settings_source()
+        try:
+            print_pdf_with_dialog(self, self._reprint_pdf(row), settings["label_w_mm"], settings["label_h_mm"])
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка печати", str(e))
 
     def _export_excel(self):
         rows = list_history(self.conn)
